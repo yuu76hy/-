@@ -1,82 +1,89 @@
-- name: Install & Connect Tailscale (Offline Fix)
-  shell: pwsh
-  env:
-    TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-  run: |
-    Write-Host "=== Installing Tailscale (Offline Mode) ==="
-    
-    # 修复1：彻底替换下载地址（用微软商店镜像，稳定无404）
-    $tsUrl = "https://download.microsoft.com/download/8/5/7/85787481-745d-485b-9063-d826f2f0a772/tailscale-1.68.1.msi"
-    $tsFile = "tailscale.msi"
-    
-    # 修复2：强制使用英文半角引号，增加重试+超时
-    $retry = 0
-    $maxRetry = 3
-    $downloadOk = $false
-    while ($retry -lt $maxRetry -and -not $downloadOk) {
-      try {
-        # 禁用SSL验证（解决跨境访问证书问题）
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $tsUrl -OutFile $tsFile -TimeoutSec 120 -UseBasicParsing -ErrorAction Stop
-        $downloadOk = $true
-        Write-Host "✅ Tailscale安装包下载成功"
-      } catch {
-        $retry++
-        Write-Warning "下载失败，重试第$retry次：$_"
-        Start-Sleep -Seconds 10
-      }
-    }
-    
-    if (-not $downloadOk) {
-      Write-Error "❌ 多次下载失败，改用备用方案..."
-      # 备用方案：直接用winget安装（Windows内置包管理器）
-      try {
-        winget install --id Tailscale.Tailscale --silent --accept-package-agreements --accept-source-agreements
-        Write-Host "✅ 备用方案：winget安装Tailscale成功"
-      } catch {
-        Write-Error "❌ 所有安装方式均失败，请检查网络！"
-        exit 1
-      }
-    } else {
-      # 安装MSI包（静默安装）
-      Start-Process msiexec.exe -ArgumentList "/i $tsFile /qn /norestart" -Wait -NoNewWindow
-      Write-Host "✅ MSI安装包安装成功"
-    }
+name: Windows RDP Server (English + 5-digit Password + Ngrok)
+on:
+  workflow_dispatch:
 
-    # 验证安装
-    Start-Sleep -Seconds 5 # 等待服务加载
-    if (-not (Get-Command "tailscale" -ErrorAction SilentlyContinue)) {
-      Write-Error "❌ Tailscale安装后未找到可执行文件"
-      exit 1
-    }
+jobs:
+  windows-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 300
+    env:
+      RDP_USER: vum
+      RUN_DURATION: 18000
 
-    # 验证密钥
-    if (-not $env:TAILSCALE_AUTH_KEY) {
-      Write-Error "❌ 未配置TAILSCALE_AUTH_KEY！请在仓库Secrets中添加"
-      exit 1
-    }
+    steps:
+      - name: Enable RDP Service
+        shell: pwsh
+        run: |
+          Write-Host "=== Enabling RDP Service ==="
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          New-NetFirewallRule -DisplayName "Allow RDP" -Direction Inbound -LocalPort 3389 -Protocol TCP -Action Allow
+          Restart-Service TermService -Force
+          Write-Host "✅ RDP Service enabled"
 
-    # 连接Tailscale（增加容错）
-    Write-Host "=== 连接Tailscale网络 ==="
-    try {
-      # 先停止旧服务，避免冲突
-      Stop-Service -Name tailscaled -ErrorAction SilentlyContinue
-      Start-Sleep -Seconds 2
-      # 连接（强制刷新）
-      tailscale up --authkey $env:TAILSCALE_AUTH_KEY `
-        --hostname "Windows-RDP-EN" `
-        --timeout 60s `
-        --accept-dns=false `
-        --accept-routes=false
-      # 获取IP
-      $tsIP = tailscale ip -4
-      if (-not $tsIP) {
-        Write-Error "❌ 未获取到Tailscale IP"
-        exit 1
-      }
-      echo "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
-      Write-Host "✅ Tailscale连接成功！访问IP：$tsIP"
-    } catch {
-      Write-Error "❌ Tailscale连接失败：$_"
-      exit 1
-    }
+      - name: Create RDP User (5-digit Password)
+        shell: pwsh
+        run: |
+          Write-Host "=== Creating RDP User ==="
+          $password = Get-Random -Minimum 10000 -Maximum 99999
+          echo "RDP_PWD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
+          
+          $securePwd = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USER -Password $securePwd -AccountNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction SilentlyContinue
+          Write-Host "✅ User created! Username: $env:RDP_USER | Password: $password"
+
+      - name: Install & Connect Ngrok (Stable Alternative)
+        shell: pwsh
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+        run: |
+          Write-Host "=== Installing Ngrok ==="
+          # Stable download address (no 404)
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "ngrok.zip" -TimeoutSec 120
+          Expand-Archive -Path ngrok.zip -DestinationPath . -Force
+          
+          # Authenticate Ngrok
+          if (-not $env:NGROK_AUTH_TOKEN) {
+            Write-Error "❌ NGROK_AUTH_TOKEN is missing! Add it to GitHub Secrets."
+            exit 1
+          }
+          .\ngrok authtoken $env:NGROK_AUTH_TOKEN
+          
+          # Map RDP port 3389
+          Start-Process -FilePath .\ngrok -ArgumentList "tcp 3389" -NoNewWindow
+          Start-Sleep -Seconds 8 # Wait for Ngrok to start
+          
+          # Get public RDP address
+          try {
+            $ngrokData = Invoke-WebRequest -Uri "http://127.0.0.1:4040/api/tunnels" -UseBasicParsing -TimeoutSec 10 | ConvertFrom-Json
+            $rdpAddress = $ngrokData.tunnels[0].public_url -replace "tcp://", ""
+            echo "RDP_ADDR=$rdpAddress" | Out-File -FilePath $env:GITHUB_ENV -Append
+            Write-Host "✅ Ngrok connected! RDP Address: $rdpAddress"
+          } catch {
+            Write-Error "❌ Failed to get Ngrok address: $_"
+            exit 1
+          }
+
+      - name: Show RDP Access Info & Keep Alive
+        shell: pwsh
+        run: |
+          Write-Host "`n========================================"
+          Write-Host "📡 Windows RDP Access Information"
+          Write-Host "========================================"
+          Write-Host "🔌 RDP Address: $env:RDP_ADDR"
+          Write-Host "👤 Username: $env:RDP_USER"
+          Write-Host "🔑 Password: $env:RDP_PWD"
+          Write-Host "⏰ Expiration: 5 Hours"
+          Write-Host "========================================`n"
+          
+          $startTime = Get-Date
+          while ($true) {
+            $elapsed = (Get-Date) - $startTime
+            if ($elapsed.TotalSeconds -ge $env:RUN_DURATION) {
+              Write-Host "⏰ 5 Hours expired! Terminating workflow."
+              exit 0
+            }
+            $remainingMins = [math]::Round(($env:RUN_DURATION - $elapsed.TotalSeconds)/60)
+            Write-Host "[$(Get-Date)] Running - Elapsed: $([math]::Round($elapsed.TotalMinutes)) mins | Remaining: $remainingMins mins"
+            Start-Sleep -Seconds 300
+          }
