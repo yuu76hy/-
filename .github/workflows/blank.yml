@@ -1,88 +1,88 @@
-name: Windows RDP Server（中文+5位密码+5小时）
+name: Windows RDP Server（英文环境+5位密码+5小时）
 on:
   workflow_dispatch:
 
 jobs:
   windows-rdp:
     runs-on: windows-latest
-    timeout-minutes: 300
+    timeout-minutes: 300  # 5小时超时
     env:
-      RDP_USER: vum  # 注意：你日志里写的是“呜”，建议改回vum，避免中文用户名问题
-      RUN_DURATION: 18000
+      RDP_USER: vum
+      RUN_DURATION: 18000  # 5小时=18000秒
 
     steps:
-      - name: 配置Windows中文环境（纯英文语法）
+      # 启用RDP服务（无需中文配置，简化步骤）
+      - name: Enable RDP Service
         shell: pwsh
         run: |
-          Write-Host "=== 安装中文语言包 ==="
-          Add-WindowsCapability -Online -Name Language.Basic~~~zh-CN~0.0.1.0 -ErrorAction SilentlyContinue
-          Set-WinSystemLocale zh-CN
-          Set-WinUserLanguageList zh-CN -Force
-          Set-WinUILanguageOverride zh-CN
-          Set-Culture zh-CN
-          tzutil /s "China Standard Time"
-          Write-Host "✅ 中文环境配置完成"
-
-      - name: 启用并配置RDP
-        shell: pwsh
-        run: |
-          Write-Host "=== 配置RDP服务 ==="
+          Write-Host "=== Enabling RDP Service ==="
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
           New-NetFirewallRule -DisplayName "Allow RDP" -Direction Inbound -LocalPort 3389 -Protocol TCP -Action Allow
           Restart-Service TermService -Force
-          Write-Host "✅ RDP服务已启用"
+          Write-Host "✅ RDP Service enabled"
 
-      - name: 创建RDP用户（5位数字密码）
+      # 创建RDP用户（5位数字密码）
+      - name: Create RDP User (5-digit password)
         shell: pwsh
         run: |
-          Write-Host "=== 创建RDP用户 ==="
+          Write-Host "=== Creating RDP User ==="
+          # 生成5位随机数字密码
           $password = Get-Random -Minimum 10000 -Maximum 99999
           echo "RDP_PWD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
           
+          # 创建本地用户并授予管理员权限
           $securePwd = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name $env:RDP_USER -Password $securePwd -AccountNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction SilentlyContinue
-          Write-Host "✅ 用户创建完成，密码：$password"
+          Write-Host "✅ User created successfully! Username: $env:RDP_USER | Password: $password"
 
-      - name: 安装并连接Tailscale
+      # 安装并连接Tailscale
+      - name: Install & Connect Tailscale
         shell: pwsh
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          Write-Host "=== 安装Tailscale ==="
+          Write-Host "=== Installing Tailscale ==="
+          # 下载Tailscale安装包
           Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/windows/tailscale-setup.exe" -OutFile "tailscale.exe"
+          # 静默安装
           Start-Process -FilePath .\tailscale.exe -ArgumentList "/silent" -Wait
           
+          # 验证Tailscale密钥是否配置
           if (-not $env:TAILSCALE_AUTH_KEY) {
-            Write-Error "❌ 请先在仓库Secrets中配置TAILSCALE_AUTH_KEY！"
+            Write-Error "❌ TAILSCALE_AUTH_KEY is not configured! Please add it to repository Secrets."
             exit 1
           }
-          tailscale up --authkey $env:TAILSCALE_AUTH_KEY --hostname "Windows-RDP-zh"
+          
+          # 连接Tailscale并获取IP
+          tailscale up --authkey $env:TAILSCALE_AUTH_KEY --hostname "Windows-RDP-EN"
           $tsIP = tailscale ip -4
           echo "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "✅ Tailscale连接成功，IP：$tsIP"
+          Write-Host "✅ Tailscale connected! Access IP: $tsIP"
 
-      - name: 显示访问信息+保持连接
+      # 显示访问信息+保持5小时连接
+      - name: Show Access Info & Keep Alive
         shell: pwsh
         run: |
           Write-Host "`n========================================"
-          Write-Host "📡 中文Windows RDP 访问信息"
+          Write-Host "📡 Windows RDP Access Information"
           Write-Host "========================================"
           Write-Host "🔌 Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "👤 用户名: $env:RDP_USER"
-          Write-Host "🔑 密码: $env:RDP_PWD"
-          Write-Host "⏰ 有效期: 5小时"
-          Write-Host "⚠️  关闭工作流后数据失效！"
+          Write-Host "👤 Username: $env:RDP_USER"
+          Write-Host "🔑 Password: $env:RDP_PWD"
+          Write-Host "⏰ Expiration: 5 Hours"
+          Write-Host "⚠️  All data will be lost after workflow ends!"
           Write-Host "========================================`n"
           
-          $start = Get-Date
+          # 保持连接，5小时后自动终止
+          $startTime = Get-Date
           while ($true) {
-            $elapsed = (Get-Date) - $start
+            $elapsed = (Get-Date) - $startTime
             if ($elapsed.TotalSeconds -ge $env:RUN_DURATION) {
-              Write-Host "⏰ 5小时已到，自动终止"
+              Write-Host "`n⏰ 5 Hours expired! Workflow is terminating."
               exit 0
             }
-            $remaining = [math]::Round(($env:RUN_DURATION - $elapsed.TotalSeconds)/60)
-            Write-Host "[$(Get-Date)] 运行中 - 已运行$([math]::Round($elapsed.TotalMinutes))分钟 | 剩余$remaining分钟"
+            $remainingMins = [math]::Round(($env:RUN_DURATION - $elapsed.TotalSeconds)/60)
+            Write-Host "[$(Get-Date)] Running - Elapsed: $([math]::Round($elapsed.TotalMinutes)) mins | Remaining: $remainingMins mins"
             Start-Sleep -Seconds 300
           }
