@@ -1,0 +1,57 @@
+name: Windows RDP Server
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 300  # 改为5小时（300分钟）
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 安装中文语言包并设置中文
+        shell: pwsh
+        run: |
+          # 安装简体中文基础语言包
+          Add-WindowsCapability -Online -Name Language.Basic~~~zh-CN~0.0.1.0
+          # 设置系统区域、用户语言等为中文
+          Set-WinSystemLocale zh-CN
+          Set-WinUserLanguageList zh-CN -Force
+          Set-WinUILanguageOverride zh-CN
+
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: .github/workflows/scripts/win-configure-rdp.ps1
+
+      - name: Create RDP User with Secure Password
+        shell: pwsh
+        run: .github/workflows/scripts/win-create-user.ps1
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: .github/workflows/scripts/win-install-tailscale.ps1
+
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: .github/workflows/scripts/win-establish-ts.ps1
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: .github/workflows/scripts/win-verify-rdp.ps1
+
+      - name: Maintain Connection
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP 连接信息 ==="
+          Write-Host "地址: $env:TAILSCALE_IP"
+          Write-Host "用户名: vum"
+          Write-Host "密码: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP 保持活跃中"
+            Start-Sleep -Seconds 300
