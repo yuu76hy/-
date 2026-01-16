@@ -1,114 +1,112 @@
 name: Windows RDP Server (Tailscale + 5-digit Password)
 on:
-  workflow_dispatch:  # 仅手动触发
+  workflow_dispatch:
 
 jobs:
   windows-rdp:
     runs-on: windows-latest
-    timeout-minutes: 300  # 5小时超时
+    timeout-minutes: 300
     env:
-      RDP_USER: vum       # RDP登录用户名
-      RUN_DURATION: 18000 # 5小时=18000秒
+      RDP_USER: vum
+      RUN_DURATION: 18000
+      # 手动指定Tailscale默认安装路径（解决环境变量问题）
+      TAILSCALE_PATH: "C:\\Program Files\\Tailscale\\tailscale.exe"
 
     steps:
-      # 步骤1：启用RDP远程桌面服务
       - name: Enable RDP Service
         shell: pwsh
         run: |
           Write-Host "=== Enabling RDP Service ==="
-          # 启用RDP注册表项
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-          # 开放3389端口防火墙
           New-NetFirewallRule -DisplayName "Allow RDP" -Direction Inbound -LocalPort 3389 -Protocol TCP -Action Allow
-          # 重启RDP服务确保生效
           Restart-Service TermService -Force -ErrorAction SilentlyContinue
           Write-Host "✅ RDP Service enabled successfully"
 
-      # 步骤2：创建RDP用户（5位数字密码）
       - name: Create RDP User (5-digit Password)
         shell: pwsh
         run: |
           Write-Host "=== Creating RDP User ==="
-          # 生成5位随机阿拉伯数字密码（10000-99999）
           $password = Get-Random -Minimum 10000 -Maximum 99999
-          # 保存密码到环境变量供后续使用
           echo "RDP_PWD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
           
-          # 创建本地用户（已存在则忽略）
           $securePwd = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name $env:RDP_USER -Password $securePwd -AccountNeverExpires -ErrorAction SilentlyContinue
-          # 将用户添加到管理员组
           Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction SilentlyContinue
           Write-Host "✅ RDP User created! Username: $env:RDP_USER | Password: $password"
 
-      # 步骤3：通过winget安装Tailscale（无手动下载，避开404/文件类型问题）
-      - name: Install Tailscale via winget
+      # 修复核心：手动指定路径+验证+强制启动服务
+      - name: Install Tailscale via winget (Fix Path)
         shell: pwsh
         run: |
           Write-Host "=== Installing Tailscale via winget ==="
-          # 确保winget可用（Windows 10/11内置）
-          if (-not (Get-Command "winget" -ErrorAction SilentlyContinue)) {
-            Write-Error "❌ winget is not available on this system"
-            exit 1
-          }
+          # 1. 强制卸载旧版本（避免冲突）
+          winget uninstall --id Tailscale.Tailscale --silent -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
           
-          # 静默安装Tailscale（自动接受协议）
+          # 2. 静默安装最新版本
           winget install --id Tailscale.Tailscale `
             --silent `
             --accept-package-agreements `
             --accept-source-agreements `
             --disable-interactivity
           
-          # 验证安装结果
-          Start-Sleep -Seconds 10 # 等待安装完成
-          if (Get-Command "tailscale" -ErrorAction SilentlyContinue) {
-            Write-Host "✅ Tailscale installed successfully via winget"
+          # 3. 等待安装完成+手动验证路径
+          Start-Sleep -Seconds 15
+          if (Test-Path $env:TAILSCALE_PATH) {
+            Write-Host "✅ Tailscale installed at: $env:TAILSCALE_PATH"
+            # 将路径加入临时环境变量
+            $env:PATH += ";C:\Program Files\Tailscale"
           } else {
-            Write-Error "❌ Tailscale installation failed"
-            exit 1
+            # 备用路径（32位系统）
+            $altPath = "C:\Program Files (x86)\Tailscale\tailscale.exe"
+            if (Test-Path $altPath) {
+              Write-Host "✅ Tailscale found at alternative path: $altPath"
+              $env:TAILSCALE_PATH = $altPath
+              $env:PATH += ";C:\Program Files (x86)\Tailscale"
+            } else {
+              Write-Error "❌ Tailscale executable not found in default paths"
+              exit 1
+            }
           }
 
-      # 步骤4：连接Tailscale网络并获取访问IP
+          # 4. 强制启动Tailscale服务
+          Write-Host "=== Starting Tailscale Service ==="
+          Start-Service -Name tailscaled -ErrorAction SilentlyContinue
+          if (-not (Get-Service -Name tailscaled -ErrorAction SilentlyContinue)) {
+            # 手动启动服务文件
+            Start-Process -FilePath $env:TAILSCALE_PATH -ArgumentList "service install" -Wait -NoNewWindow
+            Start-Service -Name tailscaled -ErrorAction SilentlyContinue
+          }
+          Write-Host "✅ Tailscale service started"
+
       - name: Connect to Tailscale Network
         shell: pwsh
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           Write-Host "=== Connecting to Tailscale ==="
-          # 验证密钥是否配置
           if (-not $env:TAILSCALE_AUTH_KEY) {
-            Write-Error "❌ TAILSCALE_AUTH_KEY is missing! Add it to GitHub Repository Secrets."
+            Write-Error "❌ TAILSCALE_AUTH_KEY is missing!"
             exit 1
           }
           
-          # 停止旧的Tailscale服务避免冲突
-          Stop-Service -Name tailscaled -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 2
+          # 使用完整路径执行tailscale命令（核心修复）
+          & $env:TAILSCALE_PATH up --authkey $env:TAILSCALE_AUTH_KEY `
+            --hostname "Windows-RDP-EN" `
+            --timeout 60s `
+            --accept-dns=false `
+            --accept-routes=false
           
-          # 连接Tailscale（设置超时和主机名）
-          try {
-            tailscale up --authkey $env:TAILSCALE_AUTH_KEY `
-              --hostname "Windows-RDP-EN" `
-              --timeout 60s `
-              --accept-dns=false `
-              --accept-routes=false
-          
-            # 获取Tailscale内网IP
-            $tsIP = tailscale ip -4
-            if (-not $tsIP -or $tsIP -eq "") {
-              Write-Error "❌ Failed to get Tailscale IP address"
-              exit 1
-            }
-          
-            # 保存IP到环境变量
-            echo "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
-            Write-Host "✅ Tailscale connected! Access IP: $tsIP"
-          } catch {
-            Write-Error "❌ Tailscale connection failed: $_"
+          # 获取IP（兼容两种路径）
+          $tsIP = & $env:TAILSCALE_PATH ip -4
+          if (-not $tsIP -or $tsIP -eq "") {
+            Write-Error "❌ Failed to get Tailscale IP address"
             exit 1
           }
+          
+          echo "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "✅ Tailscale connected! Access IP: $tsIP"
 
-      # 步骤5：显示RDP访问信息+保持5小时连接
       - name: Show RDP Info & Keep Alive
         shell: pwsh
         run: |
@@ -119,10 +117,8 @@ jobs:
           Write-Host "👤 RDP Username: $env:RDP_USER"
           Write-Host "🔑 RDP Password: $env:RDP_PWD"
           Write-Host "⏰ Expiration Time: 5 Hours"
-          Write-Host "⚠️  All data will be lost after workflow ends!"
           Write-Host "========================================`n"
           
-          # 保持连接5小时后自动终止
           $startTime = Get-Date
           while ($true) {
             $elapsed = (Get-Date) - $startTime
@@ -130,9 +126,8 @@ jobs:
               Write-Host "⏰ 5 Hours expired! Workflow terminating..."
               exit 0
             }
-            # 实时显示运行时长和剩余时长
             $elapsedMins = [math]::Round($elapsed.TotalMinutes)
             $remainingMins = [math]::Round(($env:RUN_DURATION - $elapsed.TotalSeconds)/60)
             Write-Host "[$(Get-Date)] Running - Elapsed: $elapsedMins mins | Remaining: $remainingMins mins"
-            Start-Sleep -Seconds 300 # 每5分钟输出一次状态
+            Start-Sleep -Seconds 300
           }
